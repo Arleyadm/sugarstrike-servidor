@@ -1,0 +1,22 @@
+name: manter a sala acordada
+
+# O plano gratuito do Render desliga o servidor depois de 15 minutos sem
+# ninguem conectado, e o proximo jogador espera cerca de 50 segundos. Esta
+# tarefa visita o endereco a cada 10 minutos para que isso nao aconteca.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  acordar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Visitar a sala online
+        run: |
+          codigo=$(curl -s -o resposta.txt -w "%{http_code}" --max-time 120 \
+            https://sugarstrike-servidor.onrender.com/status)
+          echo "codigo HTTP: $codigo"
+          cat resposta.txt
+          test "$codigo" = "200"
