@@ -1,0 +1,17 @@
+{
+  "name": "sugar-strike-online-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sala online única do Sugar Strike",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
+  }
+}

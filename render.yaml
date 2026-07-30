@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: sugarstrike
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /status
