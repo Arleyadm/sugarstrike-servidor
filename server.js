@@ -10,12 +10,21 @@ const PORT = Math.max(1024, Math.min(65535, Number(process.env.PORT || process.e
 const HOST = process.env.SUGAR_HOST || (process.env.PORT ? "0.0.0.0" : "127.0.0.1");
 const MIN_ROOM_SIZE = 2;
 const MAX_ROOM_SIZE = 12;
+const MAX_SPECTATORS = 12;
 const MAX_ROOMS = 60;
 const MAX_MESSAGE_BYTES = 96 * 1024;
 const RECONNECT_GRACE_MS = 15000;
 // Uma sala sem ninguém conectado é apagada depois deste tempo.
 const EMPTY_ROOM_MS = 120000;
 const SWEEP_MS = 10000;
+
+// Os mesmos limites das armas do cliente. O servidor usa estes números para
+// validar cadência, carregador e recarga antes de encaminhar uma ação ao dono.
+const WEAPON_MAG = [30, 30, 5, 7, 20, 12, 50, 30, 8, 100, 0, 2, 0, 0, 3];
+const WEAPON_RESERVE = [90, 90, 25, 35, 80, 48, 100, 90, 32, 100, 0, 0, 0, 0, 0];
+const WEAPON_RATE_MS = [100, 90, 1450, 320, 130, 190, 66, 80, 850, 66, 450, 1100, 720, 280, 950];
+const WEAPON_RELOAD_MS = [2400, 2200, 3400, 2100, 1650, 1900, 2900, 2500, 2800, 5400, 0, 0, 0, 0, 0];
+const MELEE_WEAPONS = new Set([10, 12, 13]);
 
 const rooms = new Map();     // id -> sala
 const sessions = new Map();  // token -> cliente
@@ -53,24 +62,71 @@ function json(res, status, body) {
   res.end(payload);
 }
 
-function connectedCount(room) {
-  let count = 0;
+function connectedCounts(room) {
+  let players = 0;
+  let spectators = 0;
   for (const client of room.clients.values()) {
-    if (client.ws && client.ws.readyState === WebSocket.OPEN) count += 1;
+    if (!client.ws || client.ws.readyState !== WebSocket.OPEN) continue;
+    if (client.spectator) spectators += 1;
+    else players += 1;
   }
-  return count;
+  return {players: players, spectators: spectators};
+}
+
+function connectedCount(room) {
+  return connectedCounts(room).players;
+}
+
+function connectedSpectators(room) {
+  return connectedCounts(room).spectators;
+}
+
+function teamForNewPlayer(room) {
+  let red = 0;
+  let greenYellow = 0;
+  for (const client of room.clients.values()) {
+    if (client.spectator) continue;
+    if (client.team === 1) red += 1;
+    else if (client.team === 2) greenYellow += 1;
+  }
+  if (red < greenYellow) return 1;
+  if (greenYellow < red) return 2;
+  // Com as quantidades empatadas, o desempate é aleatório e feito no servidor.
+  return crypto.randomInt(0, 2) === 0 ? 1 : 2;
+}
+
+function resetCombat(client) {
+  client.combat = {
+    weapon: 0,
+    mags: WEAPON_MAG.slice(),
+    reserves: WEAPON_RESERVE.slice(),
+    reload: null,
+    lastShotAt: 0
+  };
+}
+
+function clientById(room, id) {
+  for (const candidate of room.clients.values()) {
+    if (candidate.id === id) return candidate;
+  }
+  return null;
 }
 
 function roomSummary(room) {
+  const counts = connectedCounts(room);
   return {
     id: room.id,
     name: room.name,
     map: room.map,
     mode: room.mode,
-    players: connectedCount(room),
+    players: counts.players,
+    spectators: counts.spectators,
     max: room.max,
+    maxSpectators: MAX_SPECTATORS,
     status: room.status,
-    locked: room.locked
+    locked: room.locked,
+    allowSpectators: room.allowSpectators,
+    friendlyFire: room.friendlyFire
   };
 }
 
@@ -119,7 +175,8 @@ function announceRoom(room) {
 }
 
 function touchEmptiness(room) {
-  room.emptySince = connectedCount(room) === 0 ? Date.now() : 0;
+  const counts = connectedCounts(room);
+  room.emptySince = counts.players + counts.spectators === 0 ? Date.now() : 0;
 }
 
 function dropRoom(room, why) {
@@ -141,6 +198,7 @@ function promoteNewHost(room) {
   let candidate = null;
   for (const client of room.clients.values()) {
     if (!client.ws || client.ws.readyState !== WebSocket.OPEN) continue;
+    if (client.spectator) continue;
     if (!candidate || client.joinedAt < candidate.joinedAt) candidate = client;
   }
   if (!candidate) {
@@ -151,9 +209,14 @@ function promoteNewHost(room) {
   }
   candidate.role = "host";
   candidate.id = "host";
+  candidate.spectator = false;
+  if (!candidate.team) candidate.team = teamForNewPlayer(room);
   room.hostToken = candidate.token;
   room.status = "lobby";
-  send(candidate, {net: "promoted", id: "host", room: roomSummary(room)});
+  send(candidate, {
+    net: "promoted", id: "host", team: candidate.team | 0,
+    spectator: false, room: roomSummary(room)
+  });
   for (const client of room.clients.values()) {
     if (client === candidate) continue;
     send(client, {net: "host_changed", room: roomSummary(room)});
@@ -195,12 +258,17 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === "/status" || url.pathname === "/") {
     let players = 0;
-    for (const room of rooms.values()) players += connectedCount(room);
+    let spectators = 0;
+    for (const room of rooms.values()) {
+      players += connectedCount(room);
+      spectators += connectedSpectators(room);
+    }
     return json(res, 200, {
       game: "Sugar Strike",
       online: true,
       rooms: rooms.size,
       players: players,
+      spectators: spectators,
       maxRooms: MAX_ROOMS,
       maxPerRoom: MAX_ROOM_SIZE
     });
@@ -224,9 +292,13 @@ function createRoom(params) {
     mode: clean(params.get("mode"), "deathmatch", 16),
     max: Math.max(MIN_ROOM_SIZE, Math.min(MAX_ROOM_SIZE, Number(params.get("max")) || 8)),
     locked: params.get("locked") === "1",
+    allowSpectators: params.get("spectators") !== "0",
+    friendlyFire: params.get("friendlyFire") === "1",
     status: "lobby",
+    teamsLocked: false,
     hostToken: null,
     clients: new Map(),
+    teamHistory: new Map(),
     nextPeerId: 1,
     emptySince: Date.now(),
     createdAt: Date.now()
@@ -286,20 +358,36 @@ function attach(ws, request) {
         ws.close(1008, "no_room");
         return;
       }
-      if (connectedCount(room) >= room.max) {
+      const wantsSpectator = params.get("spectator") === "1";
+      if (wantsSpectator && !room.allowSpectators) {
+        ws.send(JSON.stringify({net: "spectator_blocked"}));
+        ws.close(1008, "spectators_blocked");
+        return;
+      }
+      if (wantsSpectator && connectedSpectators(room) >= MAX_SPECTATORS) {
+        ws.send(JSON.stringify({net: "spectator_full"}));
+        ws.close(1008, "spectator_full");
+        return;
+      }
+      if (!wantsSpectator && connectedCount(room) >= room.max) {
         ws.send(JSON.stringify({net: "full"}));
         ws.close(1008, "room_full");
         return;
       }
     }
+    const wantsSpectator = params.get("spectator") === "1";
     const isHost = !room.hostToken;
     const token = sessionToken();
+    const identity = clean(params.get("identity"), "", 64);
     client = {
       token: token,
       roomId: room.id,
       role: isHost ? "host" : "client",
       id: isHost ? "host" : `p${room.nextPeerId++}`,
       name: clean(params.get("player"), "", 14),
+      identity: identity,
+      spectator: isHost ? false : wantsSpectator,
+      team: 0,
       ws: ws,
       expiry: null,
       isAlive: true,
@@ -307,6 +395,10 @@ function attach(ws, request) {
       windowStart: Date.now(),
       messageCount: 0
     };
+    client.team = client.spectator ? 0 :
+      ((identity && room.teamHistory.get(identity)) || teamForNewPlayer(room));
+    if (identity && client.team) room.teamHistory.set(identity, client.team);
+    resetCombat(client);
     sessions.set(token, client);
     room.clients.set(token, client);
     if (isHost) room.hostToken = token;
@@ -322,13 +414,18 @@ function attach(ws, request) {
     id: client.id,
     session: client.token,
     resumed: resumed,
+    spectator: !!client.spectator,
+    team: client.team | 0,
     room: roomSummary(room)
   });
 
   if (client.role === "client") {
     const host = hostOf(room);
-    send(client, {net: "welcome", id: client.id});
-    if (host) send(host, {net: "peer_join", id: client.id});
+    send(client, {net: "welcome", id: client.id, spectator: !!client.spectator, team: client.team | 0});
+    if (host) send(host, {
+      net: "peer_join", id: client.id,
+      spectator: !!client.spectator, team: client.team | 0
+    });
   }
   announceRoom(room);
   console.log(`[sala ${room.id}] ${client.id} conectado${resumed ? " novamente" : ""}.`);
@@ -364,6 +461,15 @@ function attach(ws, request) {
       if (currentRoom.hostToken !== client.token) return;
       if (message.ctl === "status") {
         currentRoom.status = message.status === "playing" ? "playing" : "lobby";
+        currentRoom.teamsLocked = currentRoom.status === "playing";
+        for (const member of currentRoom.clients.values()) {
+          if (currentRoom.status === "playing") {
+            const selected = member.combat ? member.combat.weapon : 0;
+            resetCombat(member);
+            member.combat.weapon = selected;
+          }
+          else if (member.combat) member.combat.reload = null;
+        }
       } else if (message.ctl === "config") {
         currentRoom.map = clean(message.map, currentRoom.map, 16);
         currentRoom.mode = clean(message.mode, currentRoom.mode, 16);
@@ -371,17 +477,117 @@ function attach(ws, request) {
           MIN_ROOM_SIZE,
           Math.min(MAX_ROOM_SIZE, Number(message.max) || currentRoom.max)
         );
+        if (typeof message.allowSpectators === "boolean") {
+          currentRoom.allowSpectators = message.allowSpectators;
+        }
+        if (typeof message.friendlyFire === "boolean") {
+          currentRoom.friendlyFire = message.friendlyFire;
+        }
       }
       announceRoom(currentRoom);
       return;
     }
 
     if (currentRoom.hostToken === client.token) {
+      // O servidor reintroduz equipes e funções oficiais nos pacotes globais.
+      if ((message.t === "roster" || message.t === "start") && Array.isArray(message.players)) {
+        message.players = message.players.map(entry => {
+          if (!entry || !entry.id) return entry;
+          const official = clientById(currentRoom, String(entry.id));
+          if (!official) return entry;
+          return Object.assign({}, entry, {
+            team: official.team | 0,
+            spectator: !!official.spectator
+          });
+        });
+      }
+      if (message.t === "start" && Array.isArray(message.entities)) {
+        message.entities = message.entities.filter(entity => {
+          const official = entity && clientById(currentRoom, String(entity.id || ""));
+          return !official || !official.spectator;
+        }).map(entity => {
+          const official = entity && clientById(currentRoom, String(entity.id || ""));
+          return official ? Object.assign({}, entity, {team: official.team | 0}) : entity;
+        });
+      }
+      if (message.t === "world" && Array.isArray(message.entities)) {
+        message.entities = message.entities.map(entity => {
+          const official = entity && clientById(currentRoom, String(entity.id || ""));
+          return official ? Object.assign({}, entity, {team: official.team | 0}) : entity;
+        });
+      }
       sendToRoom(currentRoom, message, client);
     } else {
       const host = hostOf(currentRoom);
       if (host) {
         message.from = client.id;
+        message.team = client.team | 0;
+        message.spectator = !!client.spectator;
+
+        // Espectadores nunca enviam comandos que alteram a partida.
+        if (client.spectator && ["state", "shoot", "reload_start", "reload_commit", "reload_cancel"].includes(message.t)) {
+          return;
+        }
+
+        const combat = client.combat || (resetCombat(client), client.combat);
+        if (message.t === "hello") {
+          const requestedWeapon = Number(message.weapon);
+          if (Number.isInteger(requestedWeapon) && requestedWeapon >= 0 && requestedWeapon < WEAPON_MAG.length) {
+            combat.weapon = requestedWeapon;
+          }
+        }
+        if (message.t === "state") {
+          const requestedWeapon = Number(message.wep);
+          if (Number.isInteger(requestedWeapon) && requestedWeapon >= 0 && requestedWeapon < WEAPON_MAG.length) {
+            if (combat.weapon !== requestedWeapon) combat.reload = null;
+            combat.weapon = requestedWeapon;
+          }
+          message.wep = combat.weapon;
+        }
+        if (message.t === "reload_cancel") {
+          combat.reload = null;
+        }
+        if (message.t === "reload_start") {
+          const weapon = Number(message.w);
+          if (!Number.isInteger(weapon) || weapon !== combat.weapon || WEAPON_RELOAD_MS[weapon] <= 0) return;
+          if (combat.mags[weapon] >= WEAPON_MAG[weapon] || combat.reserves[weapon] <= 0) return;
+          const duration = WEAPON_RELOAD_MS[weapon];
+          combat.reload = {weapon: weapon, readyAt: now + duration};
+          message.w = weapon;
+          message.duration = duration / 1000;
+        }
+        if (message.t === "reload_commit") {
+          const reload = combat.reload;
+          if (!reload || now + 35 < reload.readyAt) return;
+          const weapon = reload.weapon;
+          const need = WEAPON_MAG[weapon] - combat.mags[weapon];
+          const take = Math.min(need, combat.reserves[weapon]);
+          combat.mags[weapon] += take;
+          combat.reserves[weapon] -= take;
+          combat.reload = null;
+          message.w = weapon;
+          message.mag = combat.mags[weapon];
+          message.res = combat.reserves[weapon];
+          send(client, {net: "ammo", w: weapon, mag: message.mag, res: message.res});
+        }
+        if (message.t === "shoot") {
+          const weapon = Number(message.w);
+          if (!Number.isInteger(weapon) || weapon !== combat.weapon) return;
+          if (combat.reload) return;
+          const cadence = WEAPON_RATE_MS[weapon] || 100;
+          if (now - combat.lastShotAt + 12 < cadence) return;
+          if (!MELEE_WEAPONS.has(weapon)) {
+            if (combat.mags[weapon] <= 0) return;
+            combat.mags[weapon] -= 1;
+          }
+          combat.lastShotAt = now;
+          message.serverMag = combat.mags[weapon];
+          message.serverRes = combat.reserves[weapon];
+          send(client, {
+            net: "ammo", w: weapon,
+            mag: combat.mags[weapon], res: combat.reserves[weapon]
+          });
+        }
         send(host, message);
       }
     }
@@ -439,7 +645,8 @@ const heartbeat = setInterval(() => {
 const sweeper = setInterval(() => {
   const now = Date.now();
   for (const room of Array.from(rooms.values())) {
-    if (connectedCount(room) > 0) {
+    const counts = connectedCounts(room);
+    if (counts.players + counts.spectators > 0) {
       room.emptySince = 0;
       continue;
     }
@@ -470,7 +677,7 @@ server.listen(PORT, HOST, () => {
   console.log(" SUGAR STRIKE - SERVIDOR ONLINE ATIVO");
   console.log(` Salas: http://${HOST}:${PORT}/rooms`);
   console.log(` Estado: http://${HOST}:${PORT}/status`);
-  console.log(` Ate ${MAX_ROOMS} salas, ${MAX_ROOM_SIZE} jogadores por sala.`);
+  console.log(` Ate ${MAX_ROOMS} salas, ${MAX_ROOM_SIZE} jogadores e ${MAX_SPECTATORS} espectadores por sala.`);
   console.log("==============================================");
   console.log("");
 });
