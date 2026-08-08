@@ -9,7 +9,7 @@ const PORT = Math.max(1024, Math.min(65535, Number(process.env.PORT || process.e
 // Na nuvem é preciso aceitar conexões de fora; no computador, só do próprio túnel.
 const HOST = process.env.SUGAR_HOST || (process.env.PORT ? "0.0.0.0" : "127.0.0.1");
 const MIN_ROOM_SIZE = 2;
-const MAX_ROOM_SIZE = 12;
+const MAX_ROOM_SIZE = 24;
 const MAX_SPECTATORS = 12;
 const MAX_ROOMS = 60;
 const MAX_MESSAGE_BYTES = 96 * 1024;
