@@ -25,6 +25,12 @@ const WEAPON_RESERVE = [90, 90, 25, 35, 80, 48, 100, 90, 32, 100, 0, 0, 0, 0, 0]
 const WEAPON_RATE_MS = [100, 90, 1450, 320, 130, 190, 66, 80, 850, 66, 450, 1100, 720, 280, 950];
 const WEAPON_RELOAD_MS = [2400, 2200, 3400, 2100, 1650, 1900, 2900, 2500, 2800, 5400, 0, 0, 0, 0, 0];
 const MELEE_WEAPONS = new Set([10, 12, 13]);
+// Teto de reserva aceito do jogador. O cinto de munição (equipamento) dá 40% a
+// mais, então cortar na tabela crua recusava munição legítima.
+const MAX_RESERVE = WEAPON_RESERVE.map(value => Math.ceil(value * 1.4));
+// Recarga mais rápida também é equipamento (colete, 0.85): o servidor precisa
+// aceitar uma recarga um pouco mais curta do que a tabela base.
+const RELOAD_FLOOR = 0.8;
 
 const rooms = new Map();     // id -> sala
 const sessions = new Map();  // token -> cliente
@@ -103,6 +109,34 @@ function resetCombat(client) {
     reload: null,
     lastShotAt: 0
   };
+}
+
+// Conclui a recarga pendente do jogador. Vale tanto para a confirmação que
+// chegou quanto para a que se perdeu no caminho: sem isto o pedido ficava preso
+// e todo tiro seguinte era descartado calado.
+function finishServerReload(combat) {
+  const reload = combat.reload;
+  if (!reload) return -1;
+  const weapon = reload.weapon;
+  const need = WEAPON_MAG[weapon] - combat.mags[weapon];
+  const take = Math.max(0, Math.min(need, combat.reserves[weapon]));
+  combat.mags[weapon] += take;
+  combat.reserves[weapon] -= take;
+  combat.reload = null;
+  return weapon;
+}
+
+// A munição que o jogo devolve durante a partida — caixa no chão, recompensa
+// por abate, arma saqueada — é simulada no aparelho de quem joga e nunca passa
+// por aqui. O servidor aceita o número que o jogador informa, mas nunca acima
+// do teto legítimo da arma, e só para cima.
+function claimReserve(combat, weapon, claimed) {
+  const value = Number(claimed);
+  if (!Number.isFinite(value) || value <= 0) return;
+  combat.reserves[weapon] = Math.max(
+    combat.reserves[weapon],
+    Math.min(MAX_RESERVE[weapon], Math.round(value))
+  );
 }
 
 function clientById(room, id) {
@@ -393,7 +427,8 @@ function attach(ws, request) {
       isAlive: true,
       joinedAt: Date.now(),
       windowStart: Date.now(),
-      messageCount: 0
+      messageCount: 0,
+      wasDead: false
     };
     client.team = client.spectator ? 0 :
       ((identity && room.teamHistory.get(identity)) || teamForNewPlayer(room));
@@ -467,6 +502,7 @@ function attach(ws, request) {
             const selected = member.combat ? member.combat.weapon : 0;
             resetCombat(member);
             member.combat.weapon = selected;
+            member.wasDead = false;
           }
           else if (member.combat) member.combat.reload = null;
         }
@@ -513,7 +549,24 @@ function attach(ws, request) {
       if (message.t === "world" && Array.isArray(message.entities)) {
         message.entities = message.entities.map(entity => {
           const official = entity && clientById(currentRoom, String(entity.id || ""));
-          return official ? Object.assign({}, entity, {team: official.team | 0}) : entity;
+          if (!official) return entity;
+          /* Quem renasce volta com o kit cheio: é o dono da sala quem manda
+             nisso, e sem escutar aqui o servidor continuava achando que o
+             jogador estava sem bala — e engolia todo tiro dele até o fim da
+             partida. */
+          const dead = !!entity.dead;
+          if (official.wasDead && !dead) {
+            const selected = official.combat ? official.combat.weapon : 0;
+            resetCombat(official);
+            official.combat.weapon = selected;
+            send(official, {
+              net: "ammo", w: selected,
+              mag: official.combat.mags[selected],
+              res: official.combat.reserves[selected]
+            });
+          }
+          official.wasDead = dead;
+          return Object.assign({}, entity, {team: official.team | 0});
         });
       }
       sendToRoom(currentRoom, message, client);
@@ -549,22 +602,31 @@ function attach(ws, request) {
         }
         if (message.t === "reload_start") {
           const weapon = Number(message.w);
-          if (!Number.isInteger(weapon) || weapon !== combat.weapon || WEAPON_RELOAD_MS[weapon] <= 0) return;
+          if (!Number.isInteger(weapon) || weapon < 0 || weapon >= WEAPON_MAG.length) return;
+          if (WEAPON_RELOAD_MS[weapon] <= 0) return;
+          /* A troca de arma chega um ciclo depois do pedido de recarga. Recusar
+             por causa disso deixava a arma muda para os outros até o fim da
+             partida, porque o carregador daqui nunca mais enchia. */
+          combat.weapon = weapon;
+          claimReserve(combat, weapon, message.res);
           if (combat.mags[weapon] >= WEAPON_MAG[weapon] || combat.reserves[weapon] <= 0) return;
-          const duration = WEAPON_RELOAD_MS[weapon];
+          const asked = Number(message.duration) * 1000;
+          const duration = Number.isFinite(asked)
+            ? Math.min(WEAPON_RELOAD_MS[weapon] * 1.5,
+                Math.max(WEAPON_RELOAD_MS[weapon] * RELOAD_FLOOR, asked))
+            : WEAPON_RELOAD_MS[weapon];
           combat.reload = {weapon: weapon, readyAt: now + duration};
           message.w = weapon;
           message.duration = duration / 1000;
         }
         if (message.t === "reload_commit") {
           const reload = combat.reload;
-          if (!reload || now + 35 < reload.readyAt) return;
-          const weapon = reload.weapon;
-          const need = WEAPON_MAG[weapon] - combat.mags[weapon];
-          const take = Math.min(need, combat.reserves[weapon]);
-          combat.mags[weapon] += take;
-          combat.reserves[weapon] -= take;
-          combat.reload = null;
+          if (!reload) return;
+          /* Folga larga: o colete de recarga rápida e o vaivém da rede faziam a
+             confirmação chegar adiantada. Ela era descartada, o pedido ficava
+             pendente para sempre e daí em diante nenhum tiro passava. */
+          if (now + 700 < reload.readyAt) return;
+          const weapon = finishServerReload(combat);
           message.w = weapon;
           message.mag = combat.mags[weapon];
           message.res = combat.reserves[weapon];
@@ -572,12 +634,27 @@ function attach(ws, request) {
         }
         if (message.t === "shoot") {
           const weapon = Number(message.w);
-          if (!Number.isInteger(weapon) || weapon !== combat.weapon) return;
-          if (combat.reload) return;
+          if (!Number.isInteger(weapon) || weapon < 0 || weapon >= WEAPON_MAG.length) return;
+          combat.weapon = weapon;
+          if (combat.reload) {
+            if (now + 35 < combat.reload.readyAt) return;
+            // A confirmação se perdeu no caminho: encerra a recarga aqui em vez
+            // de emudecer a arma.
+            finishServerReload(combat);
+          }
           const cadence = WEAPON_RATE_MS[weapon] || 100;
           if (now - combat.lastShotAt + 12 < cadence) return;
           if (!MELEE_WEAPONS.has(weapon)) {
-            if (combat.mags[weapon] <= 0) return;
+            if (combat.mags[weapon] <= 0) {
+              /* Última rede de proteção: se a conta daqui zerou mas o jogador
+                 tem bala na tela dele (pegou caixa, saqueou, renasceu), vale o
+                 número dele. A cadência acima continua sendo o limite de
+                 verdade — o que não pode é o tiro sumir calado. */
+              const claimed = Math.round(Number(message.serverMag));
+              if (!Number.isFinite(claimed) || claimed < 0) return;
+              combat.mags[weapon] = Math.min(WEAPON_MAG[weapon], claimed + 1);
+              if (combat.mags[weapon] <= 0) return;
+            }
             combat.mags[weapon] -= 1;
           }
           combat.lastShotAt = now;
